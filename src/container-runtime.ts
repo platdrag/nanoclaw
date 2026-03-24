@@ -11,14 +11,37 @@ import { logger } from './logger.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
-/** Hostname containers use to reach the host machine. */
-export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+/** Detect if Docker is running in rootless mode (Linux only). */
+function isRootlessDocker(): boolean {
+  if (os.platform() !== 'linux') return false;
+  try {
+    const info = execSync(`${CONTAINER_RUNTIME_BIN} info --format '{{json .SecurityOptions}}'`, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+      timeout: 5000,
+    });
+    return info.includes('rootless');
+  } catch {
+    return false;
+  }
+}
+
+const ROOTLESS = isRootlessDocker();
+
+/**
+ * Hostname/IP containers use to reach the host machine.
+ * Rootless Docker (Linux): slirp4netns exposes the host at 10.0.2.2.
+ * Rootful Docker (Linux): host.docker.internal via --add-host.
+ * Docker Desktop (macOS/WSL): host.docker.internal is built-in.
+ */
+export const CONTAINER_HOST_GATEWAY = ROOTLESS ? '10.0.2.2' : 'host.docker.internal';
 
 /**
  * Address the credential proxy binds to.
  * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
- * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
- *   falling back to 0.0.0.0 if the interface isn't found.
+ * Rootless Docker (Linux): 0.0.0.0 — containers reach the host via slirp4netns (10.0.2.2),
+ *   which connects to the real host network stack, not the docker0 bridge.
+ * Rootful Docker (Linux): bind to the docker0 bridge IP so only containers can reach it.
  */
 export const PROXY_BIND_HOST =
   process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
@@ -30,7 +53,11 @@ function detectProxyBindHost(): string {
   // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
   if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
 
-  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
+  // Rootless Docker: docker0 is inside rootlesskit's network namespace,
+  // not the host's. Bind to 0.0.0.0 so slirp4netns can route to us.
+  if (ROOTLESS) return '0.0.0.0';
+
+  // Rootful Docker: bind to the docker0 bridge IP instead of 0.0.0.0
   const ifaces = os.networkInterfaces();
   const docker0 = ifaces['docker0'];
   if (docker0) {
@@ -42,7 +69,11 @@ function detectProxyBindHost(): string {
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
+  // Rootless Docker: containers reach host via slirp4netns (10.0.2.2),
+  // no --add-host needed since we use the IP directly.
+  if (ROOTLESS) return [];
+
+  // On rootful Linux, host.docker.internal isn't built-in — add it explicitly
   if (os.platform() === 'linux') {
     return ['--add-host=host.docker.internal:host-gateway'];
   }

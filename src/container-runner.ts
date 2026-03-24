@@ -56,6 +56,18 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+/**
+ * Ensure a directory exists with world-accessible permissions.
+ * Rootless Docker remaps UIDs so the container user appears as a different
+ * UID on the host. Without open permissions, the container can't write to
+ * bind-mounted directories.
+ */
+function ensureOpenDir(dirPath: string): void {
+  fs.mkdirSync(dirPath, { recursive: true, mode: 0o777 });
+  // mkdirSync mode is masked by umask, so fix it explicitly
+  try { fs.chmodSync(dirPath, 0o777); } catch { /* ignore */ }
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
@@ -121,7 +133,7 @@ function buildVolumeMounts(
     group.folder,
     '.claude',
   );
-  fs.mkdirSync(groupSessionsDir, { recursive: true });
+  ensureOpenDir(groupSessionsDir);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(
@@ -143,6 +155,7 @@ function buildVolumeMounts(
         null,
         2,
       ) + '\n',
+      { mode: 0o666 },
     );
   }
 
@@ -166,9 +179,10 @@ function buildVolumeMounts(
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  ensureOpenDir(groupIpcDir);
+  ensureOpenDir(path.join(groupIpcDir, 'messages'));
+  ensureOpenDir(path.join(groupIpcDir, 'tasks'));
+  ensureOpenDir(path.join(groupIpcDir, 'input'));
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -192,6 +206,9 @@ function buildVolumeMounts(
   );
   if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  }
+  if (fs.existsSync(groupAgentRunnerDir)) {
+    ensureOpenDir(groupAgentRunnerDir);
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -507,11 +524,7 @@ export async function runContainerAgent(
         // Full input is only included at verbose level to avoid
         // persisting user conversation content on every non-zero exit.
         if (isVerbose) {
-          logLines.push(
-            `=== Input ===`,
-            JSON.stringify(input, null, 2),
-            ``,
-          );
+          logLines.push(`=== Input ===`, JSON.stringify(input, null, 2), ``);
         } else {
           logLines.push(
             `=== Input Summary ===`,
