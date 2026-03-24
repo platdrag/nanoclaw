@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -23,6 +23,7 @@ import {
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
+  ROOTLESS,
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
@@ -61,11 +62,35 @@ interface VolumeMount {
  * Rootless Docker remaps UIDs so the container user appears as a different
  * UID on the host. Without open permissions, the container can't write to
  * bind-mounted directories.
+ *
+ * After a container writes to a bind-mounted directory, the files become owned
+ * by the remapped subordinate UID (e.g. 100999) on the host. The host process
+ * (running as UID 1000) can no longer chmod those dirs. When that happens we
+ * fall back to `docker exec --user root` to fix permissions.
  */
 function ensureOpenDir(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true, mode: 0o777 });
-  // mkdirSync mode is masked by umask, so fix it explicitly
-  try { fs.chmodSync(dirPath, 0o777); } catch { /* ignore */ }
+  // mkdirSync mode is masked by umask, so fix it explicitly.
+  try {
+    const stat = fs.statSync(dirPath);
+    if ((stat.mode & 0o777) === 0o777) return; // already correct
+    fs.chmodSync(dirPath, 0o777);
+  } catch (err) {
+    // chmod failed — likely dir is owned by a rootless-Docker remapped UID.
+    // Use the container runtime to fix permissions from inside.
+    if (ROOTLESS) {
+      try {
+        execSync(
+          `${CONTAINER_RUNTIME_BIN} run --rm --user root -v "${dirPath}:/fixdir" ${CONTAINER_IMAGE} chmod 777 /fixdir`,
+          { stdio: 'pipe', timeout: 10000 },
+        );
+      } catch (innerErr) {
+        logger.debug({ dirPath, error: innerErr }, 'Container chmod fallback failed');
+      }
+    } else {
+      logger.debug({ dirPath, error: err }, 'chmod 777 failed on ensureOpenDir');
+    }
+  }
 }
 
 function buildVolumeMounts(
@@ -261,6 +286,9 @@ function buildContainerArgs(
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
   // or when getuid is unavailable (native Windows without WSL).
+  // Note: In rootless Docker, UID remapping means container UID 1000 maps to a
+  // subordinate UID on the host regardless of --user, so we rely on 777 permissions
+  // (ensureOpenDir) for bind-mounted directories instead.
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
@@ -290,7 +318,7 @@ export async function runContainerAgent(
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
-  fs.mkdirSync(groupDir, { recursive: true });
+  ensureOpenDir(groupDir);
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');

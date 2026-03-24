@@ -26,7 +26,7 @@ function isRootlessDocker(): boolean {
   }
 }
 
-const ROOTLESS = isRootlessDocker();
+export const ROOTLESS = isRootlessDocker();
 
 /**
  * Hostname/IP containers use to reach the host machine.
